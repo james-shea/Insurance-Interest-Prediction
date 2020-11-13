@@ -1,0 +1,438 @@
+*Import Data;
+FILENAME REFFILE '/folders/myfolders/C772Orig.csv';
+PROC IMPORT DATAFILE=REFFILE
+	DBMS=CSV REPLACE
+	OUT=C772.INSURANCE;
+	GETNAMES=YES;
+RUN;
+PROC CONTENTS DATA=C772.INSURANCE; 
+RUN;
+
+*Clean Data;
+*ID column is dropped as it is not needed;
+DATA cleaned(DROP = ID); 
+SET C772.INSURANCE;
+RUN;
+
+/*Convert categorical variables to binary where appropriate;
+data cleaned(drop=gender vehicle_damage Vehicle_Age RENAME = (Sex=Gender vehicle=vehicle_damage vage= Vehicle_Age));
+set clean;
+if gender='Female' then Sex=1;
+else Sex=0;
+if vehicle_damage='Yes' then vehicle=1;
+else vehicle=0;
+if Vehicle_Age='< 1 Year' then vage=0;
+else vage=1;
+run;
+*/
+
+*Check for missing data;
+ods noproctitle;
+
+proc format;
+	value _nmissprint low-high="Non-missing";
+	value $_cmissprint " "=" " other="Non-missing";
+run;
+
+proc freq data=WORK.CLEANED;
+	title3 "Missing Data Frequencies";
+	title4 h=2 "Legend: ., A, B, etc = Missing";
+	format Age Driving_License Region_Code Previously_Insured Annual_Premium 
+		Policy_Sales_Channel Vintage Response _nmissprint.;
+	format Gender Vehicle_Age Vehicle_Damage $_cmissprint.;
+	tables Gender Age Driving_License Region_Code Previously_Insured Vehicle_Age 
+		Vehicle_Damage Annual_Premium Policy_Sales_Channel Vintage Response / missing 
+		nocum;
+run;
+
+proc freq data=WORK.CLEANED noprint;
+	table Gender * Age * Driving_License * Region_Code * Previously_Insured * 
+		Vehicle_Age * Vehicle_Damage * Annual_Premium * Policy_Sales_Channel * 
+		Vintage * Response / missing out=Work._MissingData_;
+	format Age Driving_License Region_Code Previously_Insured Annual_Premium 
+		Policy_Sales_Channel Vintage Response _nmissprint.;
+	format Gender Vehicle_Age Vehicle_Damage $_cmissprint.;
+run;
+
+proc print data=Work._MissingData_ noobs label;
+	title3 "Missing Data Patterns across Variables";
+	title4 h=2 "Legend: ., A, B, etc = Missing";
+	format Age Driving_License Region_Code Previously_Insured Annual_Premium 
+		Policy_Sales_Channel Vintage Response _nmissprint.;
+	format Gender Vehicle_Age Vehicle_Damage $_cmissprint.;
+	label count="Frequency" percent="Percent";
+run;
+
+title3;
+
+/* Clean up */
+proc delete data=Work._MissingData_;
+run;
+*Distribution of Annual Premium-----------------------------------------------------------------------------------------------;
+ods noproctitle;
+ods graphics / imagemap=on;
+
+proc means data=WORK.CLEANED chartype mean std min max median n vardef=df 
+		qmethod=os;
+	var Annual_Premium;
+run;
+
+/* Graph template to construct combination histogram/boxplot */
+proc template;
+	define statgraph histobox;
+		dynamic AVAR ByVarInfo __mean __std __min __max __median __n;
+		begingraph;
+		entrytitle "Distribution of " AVAR ByVarInfo;
+		layout lattice / rows=2 columndatarange=union rowgutter=0 rowweights=(0.75 
+			0.25);
+		layout overlay / yaxisopts=(offsetmax=0.1) xaxisopts=(display=none);
+		layout gridded / columns=2 border=on autoalign=(topright topleft);
+		%let _lft = halign=left;
+		%let _rgt = halign=right;
+		entry &_lft "Mean";
+		entry &_rgt __mean;
+		entry &_lft "Std Dev";
+		entry &_rgt __std;
+		entry &_lft "Min";
+		entry &_rgt __min;
+		entry &_lft "Max";
+		entry &_rgt __max;
+		entry &_lft "Median";
+		entry &_rgt __median;
+		entry &_lft "N";
+		entry &_rgt __n;
+		endlayout;
+		histogram AVAR /;
+		endlayout;
+		layout overlay /;
+		BoxPlot Y=AVAR / orient=horizontal;
+		endlayout;
+		endlayout;
+		endgraph;
+	end;
+run;
+
+/* Macro to subset data and create a histobox for every by group */
+%macro byGroupHistobox(data=, level=, num_level=, byVars=, num_byvars=, avar=);
+	%do j=1 %to &num_byvars;
+		%let varName&j=%scan(%str(&byVars), &j);
+	%end;
+
+	%do i=1 %to &num_level;
+
+		/* Get group variable values */
+		data _null_;
+			i=&i;
+			set &level point=i;
+
+			%do j=1 %to &num_byvars;
+				call symputx("x&j", strip(&&varName&j), 'l');
+			%end;
+			stop;
+		run;
+
+		/* Build proc sql where clause */
+        %let dsid=%sysfunc(open(&data));
+		%let whereClause=;
+
+		%do j=1 %to %eval(&num_byvars-1);
+			%let varnum=%sysfunc(varnum(&dsid, &&varName&j));
+
+			%if(%sysfunc(vartype(&dsid, &varnum))=C) %then
+				%let whereClause=&whereClause.&&varName&j.="&&x&j"%str( and );
+			%else
+				%let whereClause=&whereClause.&&varName&j.=&&x&j.%str( and );
+		%end;
+		%let varnum=%sysfunc(varnum(&dsid, &&varName&num_byvars));
+
+		%if(%sysfunc(vartype(&dsid, &varnum))=C) %then
+			%let whereClause=&whereClause.&&varName&num_byvars.="&&x&num_byvars";
+		%else
+			%let whereClause=&whereClause.&&varName&num_byvars.=&&x&num_byvars;
+		%let rc=%sysfunc(close(&dsid));
+
+		/* Subset the data set */
+		proc sql noprint;
+			create table WORK.tempData as select * from &data
+            where &whereClause;
+		quit;
+
+		/* Build plot group info */
+        %let groupInfo=;
+
+		%do j=1 %to %eval(&num_byvars-1);
+			%let groupInfo=&groupInfo.&&varName&j.=&&x&j%str( );
+		%end;
+		%let groupInfo=&groupInfo.&&varName&num_byvars.=&&x&num_byvars;
+
+		/* Get inset statistics */
+		data _null_;
+			i=&i;
+			set WORK.TempOutputDS6221 point=i;
+			call symputx("__mean", strip(&avar._Mean), 'l');
+			call symputx("__std", strip(&avar._StdDev), 'l');
+			call symputx("__min", strip(&avar._Min), 'l');
+			call symputx("__max", strip(&avar._Max), 'l');
+			call symputx("__median", strip(&avar._Median), 'l');
+			call symputx("__n", strip(&avar._N), 'l');
+			stop;
+		run;
+
+		/* Create histogram/boxplot combo plot */
+		proc sgrender data=WORK.tempData template=histobox;
+			dynamic AVAR="&avar" ByVarInfo=" (&groupInfo)" __mean="&__mean" 
+				__std="&__std" __min="&__min" __max="&__max" __median="&__median" 
+				__n="&__n";
+		run;
+
+	%end;
+%mend;
+
+/* If no output data set is created, generate one now for inset statistics */
+proc means data=WORK.CLEANED chartype vardef=df qmethod=os noprint;
+	var Annual_Premium;
+	output out=WORK.TempOutputDS6221 (replace=yes) mean=std=min=max=median=n= / 
+		autoname;
+run;
+
+/* Get inset statistics */
+data _null_;
+	set WORK.TempOutputDS6221;
+	call symputx("__mean", strip(Annual_Premium_Mean), 'l');
+	call symputx("__std", strip(Annual_Premium_StdDev), 'l');
+	call symputx("__min", strip(Annual_Premium_Min), 'l');
+	call symputx("__max", strip(Annual_Premium_Max), 'l');
+	call symputx("__median", strip(Annual_Premium_Median), 'l');
+	call symputx("__n", strip(Annual_Premium_N), 'l');
+	stop;
+run;
+
+proc sgrender data=WORK.CLEANED template=histobox;
+	dynamic AVAR="Annual_Premium" ByVarInfo="" __mean="&__mean" __std="&__std" 
+		__min="&__min" __max="&__max" __median="&__median" __n="&__n";
+run;
+
+proc datasets library=WORK noprint;
+	delete tempData TempOutputDS6221;
+	run;
+*Distribution of each variable------------------------------------------------------------------------------------------------;
+ods noproctitle;
+
+/*** Analyze categorical variables ***/
+title "Frequencies for Categorical Variables";
+
+proc freq data=WORK.CLEANED;
+	tables Gender Driving_License Region_Code Previously_Insured Vehicle_Damage 
+		Policy_Sales_Channel Response Vehicle_Age / plots=(freqplot);
+run;
+
+/*** Analyze numeric variables ***/
+title "Descriptive Statistics for Numeric Variables";
+
+proc means data=WORK.CLEANED n nmiss min mean median max std;
+	var Age Annual_Premium Vintage;
+run;
+
+title;
+
+proc univariate data=WORK.CLEANED noprint;
+	histogram Age Annual_Premium Vintage;
+run;
+
+*Bivariate Analysis-------------------------------------------------------------------------------------------------------;
+*Gender;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Response By Gender";
+	vbar Gender / group=Response groupdisplay=stack datalabel;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+*Age;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Response By Age";
+	vbar Age / group=Response groupdisplay=stack datalabel;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+*License;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Response By Driving License";
+	vbar Driving_License / group=Response groupdisplay=stack datalabel;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+*Region Code;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Response By Region";
+	vbar Region_Code / group=Response groupdisplay=stack datalabel;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+*Previously_Insured;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Response By Previously_Insured";
+	vbar Previously_Insured / group=Response groupdisplay=stack datalabel;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+*Vehicle_Age;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Response By Vehicle Age";
+	vbar Vehicle_Age / group=Response groupdisplay=stack datalabel;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+title;
+*Vehicle_Damage;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Response By Vehicle Damage";
+	vbar Vehicle_Age / group=Response groupdisplay=stack datalabel;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+title;
+*Annual_Premium;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Annual Premium By Response";
+	vbox Annual_Premium / category=Response;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+title;
+*Policy_Sales_Channel;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Policy Sales Channel By Response";
+	vbox Policy_Sales_Channel / category=Response;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+title;
+*Vintage;
+ods graphics / reset width=6.4in height=4.8in imagemap;
+
+proc sgplot data=WORK.CLEANED;
+	title height=14pt "Vintage By Response";
+	vbox Vintage / category=Response;
+	yaxis grid;
+run;
+
+ods graphics / reset;
+title;
+
+
+
+*Split data into two files, one for training and one for testing-----------------------------------------------------------------------;
+proc sql noprint;
+	select count(*) into :count from WORK.CLEANED;
+quit;
+
+data work.training work.testing;
+	set WORK.CLEANED;
+	retain __tmp1-__tmp%trim(&count) __nobs__ __nobs1__ __nobs2__;
+	drop _i_ __seed__ __tmp1-__tmp%trim(&count);
+	drop _n1_ __nobs__ __nobs1__ __nobs2__;
+	array __tmp(*) __tmp1-__tmp%trim(&count);
+
+	if (_n_=1) then
+		do;
+			__seed__=772;
+			__nobs__=&count;
+
+			do _i_=1 to dim(__tmp);
+				__tmp(_i_)=_i_;
+			end;
+			call ranperm(__seed__, of __tmp(*));
+			__nobs1__=round(0.75*__nobs__);
+			__nobs2__=round(0.25*__nobs__)+__nobs1__;
+		end;
+	_n1_=_n_;
+
+	if (_n1_ <=dim(__tmp)) then
+		do;
+
+			if (__tmp(_n1_) > 0) then
+				do;
+
+					if (__tmp(_n1_) <=__nobs1__) then
+						do;
+							output work.training;
+						end;
+					else if (__tmp(_n1_) <=__nobs2__) then
+						do;
+							output work.testing;
+						end;
+				end;
+		end;
+run;
+*Cluster Analysis------------------------------------------------------------------------------------------------------------------------------------------------;
+ods noproctitle;
+
+proc varclus data=WORK.CLEANED hierarchy plots;
+	var Age Driving_License Region_Code Previously_Insured Annual_Premium 
+		Policy_Sales_Channel Vintage Response;
+run;
+
+
+
+*Building Logistic Regression Model Using Stepwise;
+ods noproctitle;
+ods graphics / imagemap=on;
+
+proc logistic data=WORK.TRAINING plots=(dpc roc);
+	class Gender Driving_License Region_Code Previously_Insured Vehicle_Age 
+		Vehicle_Damage Policy_Sales_Channel / param=glm;
+	model Response(event='1')=Gender Driving_License Region_Code 
+		Previously_Insured Vehicle_Age Vehicle_Damage Policy_Sales_Channel Age 
+		Annual_Premium Vintage / link=logit selection=stepwise fast slentry=0.05 
+		slstay=0.05 hierarchy=single details technique=fisher expb stb lackfit;
+	output out = temp p=new;
+	store insurance_logistic;
+run;
+
+
+
+*Test Model;
+proc plm source=insurance_logistic;
+score data=work.testing out=test_scored predicted=p / ilink;
+run;
+
+*Check Accuracy of Model;
+data work.accuracy;
+set work.test_scored;
+if p<.5 then Guess=0;
+else Guess=1;
+if Guess = Response then accurate=1;
+else accurate=0;
+run;
+
+
+proc univariate data=accuracy;
+   var Length Width;
+   qqplot;
